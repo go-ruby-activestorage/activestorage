@@ -10,11 +10,14 @@
 **A pure-Go (no cgo) reimplementation of Rails'
 [Active Storage](https://guides.rubyonrails.org/active_storage_overview.html)** —
 the framework for attaching files to records and storing them on a pluggable
-backend. This is the **v0.1 foundation**: the `Blob` and `Attachment` model logic
-and the `Service` storage abstraction (with a local `DiskService`), faithful to
-Active Storage's observable behaviour — sharded storage keys, base64 MD5
-checksums, `has_one_attached` / `has_many_attached` semantics, `create_and_upload!`
-/ `create_before_direct_upload!` / `signed_id` — **without any Ruby runtime**.
+backend. It reproduces Active Storage's observable behaviour **byte-for-byte** —
+sharded storage keys, base64 MD5 checksums, `has_one_attached` /
+`has_many_attached` semantics, message-verifier `signed_id`s, `Marcel`-style
+content-type detection, variation digests / variant keys, and the direct-upload
+token shape — **without any Ruby runtime**. The on-disk key layout, checksum
+encoding, signed-id / variation-key format, and Marcel detection are pinned by a
+**live differential test against the `activestorage` gem** (skipped when the gem
+is absent).
 
 It is the Active Storage backend for
 [go-embedded-ruby](https://github.com/go-embedded-ruby/ruby), but is a
@@ -94,7 +97,7 @@ func main() {
 }
 ```
 
-## What v0.1 ships
+## What ships
 
 - **`Service` abstraction** — a key-addressed, streaming interface
   (`Upload` / `Download` / `DownloadChunk` / `Delete` / `Exist` / `Url` / `Size`),
@@ -112,25 +115,46 @@ func main() {
 - **`Attachment`** — `has_one_attached` (`OneAttached`) and `has_many_attached`
   (`ManyAttached`) semantics: `Attach` (of a `*Blob`, an `Upload{io,…}`, or a
   signed id), `Attached`, `Blob(s)`, `Detach`, `Purge`, and the join record.
-- **`Filename`** (base / extension / sanitized), content-type helpers, and a
-  `VariantRecord` shape stub.
+- **`RailsVerifier`** — a `Signer`/`Verifier` that reproduces
+  `ActiveSupport::MessageVerifier` **byte-for-byte** (JSON serializer, SHA-1 HMAC,
+  url-safe payload, the `{"_rails":{"message","exp","pur"}}` metadata envelope), so
+  a blob's `signed_id`, a variation key, and the disk service's direct-upload token
+  are identical to a Rails app configured with the same secret. `HMACSigner`
+  remains as a self-contained default.
+- **Content-type detection** — `DetectContentType(data, name)`, a faithful subset
+  of `Marcel::MimeType.for`: leading magic bytes first (PNG/JPEG/GIF/PDF/ZIP/…),
+  the xml→svg / zip→docx "more specific" upgrades, then extension fallback, wired
+  into the upload path (`identify:` honoured).
+- **Variants / representations** — `Variation` (transformations descriptor,
+  `Digest` = `SHA1.base64digest(Marshal.dump(transformations))` via an internal
+  MRI-exact Ruby-Marshal encoder, `Key` = the signed variation key), `Variant`
+  (combined `variants/<key>/<sha256>` service key, filename, content type,
+  `Processed`/`Process`), and `VariantRecord`. Actual pixel work is delegated to an
+  injectable **`Transformer`** seam (e.g. go-images) — **no libvips/CGO required**.
+- **Direct uploads** — `CreateForDirectUpload` / `Blob.DirectUpload` return the
+  `{signed_id, url, headers}` shape of `DirectUploadsController#create`; the
+  `DiskService` mints the signed `:blob_token` URL (`DirectUploadService`).
+- **`Filename`** — base / extension (Ruby `File.extname` semantics, incl. dotfiles)
+  and `sanitized` matching the gem's exact `tr` character set.
 
 ## Roadmap (deferred)
 
-The following Active Storage surface is intentionally **not** in v0.1 and is
-tracked for later releases:
+The following Active Storage surface is intentionally **not** implemented yet and
+is tracked for later releases:
 
-- **Image variants & transformations** (`variant`, `ImageProcessing`,
-  mini_magick / ruby-vips) and the `VariantRecord` behaviour.
+- **Actual image transformation** — the `Variant`/`Variation` *descriptors* (key,
+  digest, filename, content type) ship and match the gem; producing the transformed
+  bytes needs an injected `Transformer` (this repo ships none, to stay CGO-free —
+  a go-images-backed transformer is the intended companion).
 - **Analyzers** (image/video/audio metadata) and **previewers** (PDF/video
   poster frames).
 - **Cloud services** — S3, Google Cloud Storage, Azure, and the **mirror**
   service — layered on the existing `Service` interface.
-- **Direct uploads** — the direct-upload controller, `blob.service_url_for_direct_upload`,
-  and signed disk URLs backed by the Rails routing/engine layer.
-- **The Rails engine** — routes, controllers, and the representation redirect.
-- **Streaming uploads** — v0.1 buffers an upload in memory to compute its
-  checksum and size; a streaming/rewindable path is future work.
+- **The Rails engine** — routes, controllers, the disk/blob/representation
+  redirect and proxy controllers, and signed *download* URLs backed by the Rails
+  routing layer (the direct-upload token itself ships).
+- **Streaming uploads** — an upload is buffered in memory to compute its checksum
+  and size; a streaming/rewindable path is future work.
 
 ## Tests & coverage
 

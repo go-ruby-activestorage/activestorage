@@ -32,11 +32,12 @@ const signedIDPurpose = "blob_id"
 // randomness source (storage keys), and a clock. It is the entry point for
 // creating and finding blobs and attachments.
 type Config struct {
-	Store    ModelStore
-	Services *Registry
-	Signer   Signer
-	Random   RandomSource     // defaults to DefaultRandom() when nil
-	Clock    func() time.Time // defaults to time.Now().UTC when nil
+	Store       ModelStore
+	Services    *Registry
+	Signer      Signer
+	Random      RandomSource     // defaults to DefaultRandom() when nil
+	Clock       func() time.Time // defaults to time.Now().UTC when nil
+	Transformer Transformer      // image-processing seam for variants; nil = variants unprocessable
 }
 
 func (c *Config) now() time.Time {
@@ -83,6 +84,10 @@ type BlobParams struct {
 	Key         string
 	ByteSize    int64
 	Checksum    string
+	// Identify forces content-type detection from the uploaded bytes even when
+	// ContentType is set, mirroring Active Storage's identify: true default. When
+	// false, a caller-supplied ContentType is trusted (identify: false).
+	Identify bool
 }
 
 // buildBlob constructs an in-memory Blob from params, filling in a generated key,
@@ -136,6 +141,9 @@ func unfurl(r io.Reader, p *BlobParams) ([]byte, error) {
 	}
 	p.ByteSize = int64(len(data))
 	p.Checksum = checksumOf(data)
+	if p.ContentType == "" || p.Identify {
+		p.ContentType = DetectContentType(data, p.Filename)
+	}
 	return data, nil
 }
 
@@ -202,13 +210,75 @@ func (c *Config) FindBlob(id int64) (*Blob, error) {
 	return c.Store.FindBlob(id)
 }
 
-// FindSignedBlob verifies a signed id and loads the blob it names.
-func (c *Config) FindSignedBlob(signedID string) (*Blob, error) {
-	data, err := c.Signer.Verify(signedID, signedIDPurpose)
+// CreateForDirectUpload persists a blob from params (whose ByteSize and Checksum
+// the client precomputed) and returns it alongside the DirectUpload payload the
+// client uses to PUT the bytes and later attach the blob — the response shape of
+// ActiveStorage::DirectUploadsController#create. expiresIn bounds the signed URL.
+func (c *Config) CreateForDirectUpload(p BlobParams, expiresIn time.Duration) (*Blob, DirectUpload, error) {
+	b, err := c.CreateBeforeDirectUpload(p)
 	if err != nil {
-		return nil, err
+		return nil, DirectUpload{}, err
 	}
-	id, err := strconv.ParseInt(data, 10, 64)
+	du, err := b.DirectUpload(expiresIn)
+	if err != nil {
+		return nil, DirectUpload{}, err
+	}
+	return b, du, nil
+}
+
+// DirectUpload returns the signed URL, headers, and signed id a client needs to
+// upload the blob's bytes directly to its service — ActiveStorage's
+// service_url_for_direct_upload / service_headers_for_direct_upload / signed_id.
+// It requires the blob's service to implement DirectUploadService.
+func (b *Blob) DirectUpload(expiresIn time.Duration) (DirectUpload, error) {
+	sid, err := b.SignedID()
+	if err != nil {
+		return DirectUpload{}, err
+	}
+	svc, err := b.Service()
+	if err != nil {
+		return DirectUpload{}, err
+	}
+	du, ok := svc.(DirectUploadService)
+	if !ok {
+		return DirectUpload{}, ErrNotDirectUploadable
+	}
+	url, err := du.URLForDirectUpload(b.Key, DirectUploadOptions{
+		ContentType:   b.ContentType,
+		ContentLength: b.ByteSize,
+		Checksum:      b.Checksum,
+		ExpiresIn:     expiresIn,
+	})
+	if err != nil {
+		return DirectUpload{}, err
+	}
+	return DirectUpload{
+		SignedID: sid,
+		URL:      url,
+		Headers:  du.HeadersForDirectUpload(b.Key, b.ContentType),
+	}, nil
+}
+
+// FindSignedBlob verifies a signed id and loads the blob it names. When the
+// configured Signer is a Verifier (RailsVerifier), the id is decoded from the
+// message-verifier payload (a JSON integer); otherwise the string Signer path is
+// used.
+func (c *Config) FindSignedBlob(signedID string) (*Blob, error) {
+	var idStr string
+	if v := asVerifier(c.Signer); v != nil {
+		raw, err := v.Verified(signedID, signedIDPurpose)
+		if err != nil {
+			return nil, err
+		}
+		idStr = string(raw)
+	} else {
+		data, err := c.Signer.Verify(signedID, signedIDPurpose)
+		if err != nil {
+			return nil, err
+		}
+		idStr = data
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		return nil, err
 	}
@@ -322,8 +392,13 @@ func (b *Blob) URL(opts URLOptions) (string, error) {
 }
 
 // SignedID returns a tamper-evident, purpose-scoped id for the blob, suitable for
-// embedding in a URL — ActiveStorage::Blob#signed_id.
+// embedding in a URL — ActiveStorage::Blob#signed_id. With a RailsVerifier the
+// token is byte-identical to the gem's (the integer id, purpose "blob_id",
+// message-verifier envelope); with a plain Signer the id is signed as a string.
 func (b *Blob) SignedID() (string, error) {
+	if v := asVerifier(b.cfg.Signer); v != nil {
+		return v.Generate(b.ID, signedIDPurpose, time.Time{})
+	}
 	return b.cfg.Signer.Sign(strconv.FormatInt(b.ID, 10), signedIDPurpose)
 }
 
