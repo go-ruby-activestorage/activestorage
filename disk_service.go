@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Filesystem operation seams. These indirect the handful of syscalls whose error
@@ -24,14 +25,69 @@ var (
 // DiskService is the built-in local-filesystem Service. It stores each object at
 // Root/<key[0:2]>/<key[2:4]>/<key>, the same two-level sharding Rails'
 // ActiveStorage::Service::DiskService uses to keep directories shallow.
+//
+// When Verifier and URLPrefix are set it also mints signed direct-upload tokens
+// (DirectUploadService) the same way ActiveStorage::Service::DiskService does.
 type DiskService struct {
 	name string
 	root string
+	// Verifier signs direct-upload tokens; nil disables DirectUploadService.
+	Verifier Verifier
+	// URLPrefix is prepended to a direct-upload token; defaults to
+	// "/rails/active_storage/disk/" when empty.
+	URLPrefix string
+	// Clock supplies "now" for token expiry; defaults to time.Now.
+	Clock func() time.Time
 }
 
 // NewDiskService returns a DiskService rooted at root and registered as name.
 func NewDiskService(name, root string) *DiskService {
 	return &DiskService{name: name, root: root}
+}
+
+func (d *DiskService) now() time.Time {
+	if d.Clock != nil {
+		return d.Clock()
+	}
+	return time.Now()
+}
+
+func (d *DiskService) urlPrefix() string {
+	if d.URLPrefix != "" {
+		return d.URLPrefix
+	}
+	return "/rails/active_storage/disk/"
+}
+
+// URLForDirectUpload returns a signed URL a client can PUT bytes to, embedding a
+// message-verifier token over {key, content_type, content_length, checksum,
+// service_name} scoped to purpose :blob_token — matching
+// ActiveStorage::Service::DiskService#url_for_direct_upload.
+func (d *DiskService) URLForDirectUpload(key string, o DirectUploadOptions) (string, error) {
+	if d.Verifier == nil {
+		return "", ErrNotDirectUploadable
+	}
+	exp := time.Time{}
+	if o.ExpiresIn > 0 {
+		exp = d.now().Add(o.ExpiresIn)
+	}
+	token, err := d.Verifier.Generate(Hash{
+		{Key: "key", Value: key},
+		{Key: "content_type", Value: o.ContentType},
+		{Key: "content_length", Value: o.ContentLength},
+		{Key: "checksum", Value: o.Checksum},
+		{Key: "service_name", Value: d.name},
+	}, "blob_token", exp)
+	if err != nil {
+		return "", err
+	}
+	return d.urlPrefix() + token, nil
+}
+
+// HeadersForDirectUpload returns the headers a client must send with a direct
+// upload — just the Content-Type, as ActiveStorage::Service::DiskService does.
+func (d *DiskService) HeadersForDirectUpload(_ string, contentType string) map[string]string {
+	return map[string]string{"Content-Type": contentType}
 }
 
 // Name returns the service's registry name.

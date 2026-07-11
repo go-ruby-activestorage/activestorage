@@ -14,7 +14,38 @@ var (
 	// ErrServiceNotFound is returned by a Registry when a named service (or the
 	// default) is not configured.
 	ErrServiceNotFound = errors.New("activestorage: service not registered")
+	// ErrNotDirectUploadable is returned when a direct upload is requested from a
+	// service that does not implement DirectUploadService.
+	ErrNotDirectUploadable = errors.New("activestorage: service does not support direct uploads")
 )
+
+// DirectUploadOptions carries the blob facts a service embeds in a signed
+// direct-upload token — the content type, length, and checksum the client must
+// match, and how long the URL stays valid.
+type DirectUploadOptions struct {
+	ContentType   string
+	ContentLength int64
+	Checksum      string
+	ExpiresIn     time.Duration
+}
+
+// DirectUploadService is the optional capability of a Service that can mint a
+// signed direct-upload URL and the headers a client must send with its PUT,
+// mirroring ActiveStorage::Service#url_for_direct_upload and
+// #headers_for_direct_upload.
+type DirectUploadService interface {
+	URLForDirectUpload(key string, opts DirectUploadOptions) (string, error)
+	HeadersForDirectUpload(key, contentType string) map[string]string
+}
+
+// DirectUpload is the payload a client needs to upload straight to the service
+// and then attach the blob — the shape ActiveStorage::DirectUploadsController
+// returns: the blob's SignedID plus the upload URL and the required headers.
+type DirectUpload struct {
+	SignedID string
+	URL      string
+	Headers  map[string]string
+}
 
 // URLOptions carries the keyword options Rails passes to Service#url — how long a
 // generated URL stays valid, and the Content-Disposition/type the download should
